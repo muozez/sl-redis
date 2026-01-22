@@ -7,61 +7,103 @@ import time
 HOST = "127.0.0.1"
 PORT = 1717
 
-store = {
-    "name": ("muozez", None),
-    "status": ("active", None)
-}
-
+store = {}
 lock = threading.Lock()
-server_socket = None
 running = True
+server_socket = None
+
+def resp_simple(msg):
+    return f"+{msg}\r\n".encode()
+
+def resp_error(msg):
+    return f"-ERR {msg}\r\n".encode()
+
+def resp_bulk(value):
+    if value is None:
+        return b"$-1\r\n"
+    return f"${len(value)}\r\n{value}\r\n".encode()
+
+def resp_int(num):
+    return f":{num}\r\n".encode()
+
+def parse_resp(data):
+    lines = data.decode().split("\r\n")
+    argc = int(lines[0][1:])
+    args = []
+    i = 1
+    for _ in range(argc):
+        length = int(lines[i][1:])
+        i += 1
+        args.append(lines[i])
+        i += 1
+    return args
 
 def is_expired(expire_at):
-    return expire_at is not None and time.time() > expire_at
+    return expire_at and time.time() > expire_at
 
 def handle_client(conn, addr):
     print(f"Connected: {addr}")
     with conn:
         while running:
-            data = conn.recv(1024)
+            data = conn.recv(4096)
             if not data:
                 break
 
-            message = data.decode().strip()
-            print(f"{addr} -> {message}")
+            try:
+                args = parse_resp(data)
+            except Exception:
+                conn.sendall(resp_error("protocol error"))
+                continue
 
-            parts = message.split(" ")
-            command = parts[0].upper()
+            cmd = args[0].upper()
 
-            if command == "GET" and len(parts) == 2:
-                key = parts[1]
+            if cmd == "GET" and len(args) == 2:
+                key = args[1]
                 with lock:
                     item = store.get(key)
                     if not item:
-                        conn.sendall(b"KEY_NOT_FOUND\r\n")
+                        conn.sendall(resp_bulk(None))
                         continue
 
                     value, expire_at = item
                     if is_expired(expire_at):
                         del store[key]
-                        conn.sendall(b"KEY_EXPIRED\r\n")
+                        conn.sendall(resp_bulk(None))
                         continue
 
-                conn.sendall((value + "\r\n").encode())
+                conn.sendall(resp_bulk(value))
 
-            elif command == "SET" and len(parts) in (3, 4):
-                key = parts[1]
-                value = parts[2]
-                ttl = int(parts[3]) if len(parts) == 4 else None
-                expire_at = time.time() + ttl if ttl else None
+            elif cmd == "SET" and len(args) >= 3:
+                key = args[1]
+                value = args[2]
+                expire_at = None
+
+                if len(args) == 5 and args[3].upper() == "EX":
+                    expire_at = time.time() + int(args[4])
 
                 with lock:
                     store[key] = (value, expire_at)
 
-                conn.sendall(b"200 OK\r\n")
+                conn.sendall(resp_simple("OK"))
+
+            elif cmd == "TTL" and len(args) == 2:
+                key = args[1]
+                with lock:
+                    item = store.get(key)
+                    if not item:
+                        conn.sendall(resp_int(-2))
+                        continue
+
+                    _, expire_at = item
+                    if expire_at is None:
+                        conn.sendall(resp_int(-1))
+                        continue
+
+                    ttl = int(expire_at - time.time())
+                    conn.sendall(resp_int(max(ttl, -2)))
 
             else:
-                conn.sendall(b"INVALID_COMMAND\r\n")
+                conn.sendall(resp_error("unknown command"))
 
     print(f"Disconnected: {addr}")
 
@@ -82,7 +124,7 @@ def main():
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((HOST, PORT))
         s.listen()
-        print("Server listening...")
+        print("RESP server listening...")
 
         while running:
             try:
